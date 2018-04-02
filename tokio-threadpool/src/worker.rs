@@ -15,6 +15,8 @@ use worker_state::{
 
 use tokio_executor;
 
+use futures::Poll;
+
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -32,14 +34,30 @@ pub struct Worker {
     // Shared scheduler data
     pub(crate) inner: Arc<Inner>,
 
-    // WorkerEntry index
-    pub(crate) id: WorkerId,
-
-    // Set when the worker should finalize on drop
-    should_finalize: Cell<bool>,
+    /// The current worker state.
+    ///
+    /// It can either be a primary worker or a secondary worker.
+    state: ThreadState,
 
     // Keep the value on the current thread.
     _p: PhantomData<Rc<()>>,
+}
+
+#[derive(Debug)]
+struct Primary {
+    // Worker ID
+    id: WorkerId,
+
+    // Set when the worker should finalize on drop
+    should_finalize: Cell<bool>,
+}
+
+/// TODO: This should probably be named `WorkerState`, but that is already
+/// taken.
+#[derive(Debug)]
+enum ThreadState {
+    Primary(Primary),
+    // Backup,
 }
 
 /// Identifiers a thread pool worker.
@@ -69,12 +87,12 @@ impl Worker {
         }
 
         let inner = inner.clone();
+        let primary = Primary::new(id);
 
         th.spawn(move || {
             let worker = Worker {
                 inner,
-                id,
-                should_finalize: Cell::new(false),
+                state: ThreadState::Primary(primary),
                 _p: PhantomData,
             };
 
@@ -120,36 +138,85 @@ impl Worker {
     /// This identifier is unique scoped by the thread pool. It is possible that
     /// different thread pool instances share worker identifier values.
     pub fn id(&self) -> &WorkerId {
-        &self.id
+        use self::ThreadState::Primary;
+
+        match self.state {
+            Primary(ref primary) => &primary.id,
+            // _ => panic!("not currently a primary worker"),
+        }
+    }
+
+    /// Returns a reference to the primary entry
+    pub(crate) fn primary(&self) -> &WorkerEntry {
+        &self.inner.workers[self.id().idx]
+    }
+
+    /// Transition the current worker to a blocking worker
+    pub(crate) fn transition_to_blocking(&self) -> Poll<(), ::BlockingError> {
+        unimplemented!();
     }
 
     /// Run the worker
     ///
     /// This function blocks until the worker is shutting down.
     pub fn run(&self) {
+        use self::ThreadState::*;
+
+        match self.state {
+            Primary(ref primary) => {
+                primary.run(&self.inner);
+            }
+            // _ => panic!("worker not in primary state"),
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        use self::ThreadState::Primary;
+
+        match self.state {
+            Primary(ref mut p) => p.maybe_finalize(&self.inner),
+            // _ => {}
+        }
+    }
+}
+
+// ===== impl Primary =====
+
+impl Primary {
+    fn new(id: WorkerId) -> Primary {
+        Primary {
+            id,
+            should_finalize: Cell::new(false),
+        }
+    }
+
+    /// Run the primary worker routine
+    fn run(&self, inner: &Arc<Inner>) {
         const LIGHT_SLEEP_INTERVAL: usize = 32;
 
         // Get the notifier.
         let notify = Arc::new(Notifier {
-            inner: Arc::downgrade(&self.inner),
+            inner: Arc::downgrade(inner),
         });
-        let mut sender = Sender { inner: self.inner.clone() };
+        let mut sender = Sender { inner: inner.clone() };
 
         let mut first = true;
         let mut spin_cnt = 0;
         let mut tick = 0;
 
-        while self.check_run_state(first) {
+        while self.check_run_state(first, inner) {
             first = false;
 
             // Poll inbound until empty, transfering all tasks to the internal
             // queue.
-            let consistent = self.drain_inbound();
+            let consistent = self.drain_inbound(inner);
 
             // Run the next available task
-            if self.try_run_task(&notify, &mut sender) {
+            if self.try_run_task(&notify, &mut sender, inner) {
                 if tick % LIGHT_SLEEP_INTERVAL == 0 {
-                    self.sleep_light();
+                    self.sleep_light(inner);
                 }
 
                 tick = tick.wrapping_add(1);
@@ -160,9 +227,9 @@ impl Worker {
             }
 
             // No work in this worker's queue, it is time to try stealing.
-            if self.try_steal_task(&notify, &mut sender) {
+            if self.try_steal_task(&notify, &mut sender, inner) {
                 if tick % LIGHT_SLEEP_INTERVAL == 0 {
-                    self.sleep_light();
+                    self.sleep_light(inner);
                 }
 
                 tick = tick.wrapping_add(1);
@@ -181,7 +248,7 @@ impl Worker {
             } else {
                 tick = 0;
 
-                if !self.sleep() {
+                if !self.sleep(inner) {
                     return;
                 }
             }
@@ -192,15 +259,16 @@ impl Worker {
         self.should_finalize.set(true);
     }
 
+
     /// Checks the worker's current state, updating it as needed.
     ///
     /// Returns `true` if the worker should run.
     #[inline]
-    fn check_run_state(&self, first: bool) -> bool {
-        let mut state: WorkerState = self.entry().state.load(Acquire).into();
+    fn check_run_state(&self, first: bool, inner: &Arc<Inner>) -> bool {
+        let mut state: WorkerState = self.entry(inner).state.load(Acquire).into();
 
         loop {
-            let pool_state: State = self.inner.state.load(Acquire).into();
+            let pool_state: State = inner.state.load(Acquire).into();
 
             if pool_state.is_terminated() {
                 return false;
@@ -217,7 +285,7 @@ impl Worker {
                 lifecycle => panic!("unexpected worker state; lifecycle={}", lifecycle),
             }
 
-            let actual = self.entry().state.compare_and_swap(
+            let actual = self.entry(inner).state.compare_and_swap(
                 state.into(), next.into(), AcqRel).into();
 
             if actual == state {
@@ -233,7 +301,7 @@ impl Worker {
             trace!("Worker::check_run_state; delegate signal");
             // This worker is not ready to be signaled, so delegate the signal
             // to another worker.
-            self.inner.signal_work(&self.inner);
+            inner.signal_work(inner);
         }
 
         true
@@ -243,13 +311,17 @@ impl Worker {
     ///
     /// Returns `true` if work was found.
     #[inline]
-    fn try_run_task(&self, notify: &Arc<Notifier>, sender: &mut Sender) -> bool {
+    fn try_run_task(&self,
+                    notify: &Arc<Notifier>,
+                    sender: &mut Sender,
+                    inner: &Arc<Inner>) -> bool
+    {
         use deque::Steal::*;
 
         // Poll the internal queue for a task to run
-        match self.entry().deque.steal() {
+        match self.entry(inner).deque.steal() {
             Data(task) => {
-                self.run_task(task, notify, sender);
+                self.run_task(task, notify, sender, inner);
                 true
             }
             Empty => false,
@@ -261,27 +333,32 @@ impl Worker {
     ///
     /// Returns `true` if work was found
     #[inline]
-    fn try_steal_task(&self, notify: &Arc<Notifier>, sender: &mut Sender) -> bool {
+    fn try_steal_task(&self,
+                      notify: &Arc<Notifier>,
+                      sender: &mut Sender,
+                      inner: &Arc<Inner>)
+        -> bool
+    {
         use deque::Steal::*;
 
-        let len = self.inner.workers.len();
-        let mut idx = self.inner.rand_usize() % len;
+        let len = inner.workers.len();
+        let mut idx = inner.rand_usize() % len;
         let mut found_work = false;
         let start = idx;
 
         loop {
             if idx < len {
-                match self.inner.workers[idx].steal.steal() {
+                match inner.workers[idx].steal.steal() {
                     Data(task) => {
                         trace!("stole task");
 
-                        self.run_task(task, notify, sender);
+                        self.run_task(task, notify, sender, inner);
 
-                        trace!("try_steal_task -- signal_work; self={}; from={}",
-                               self.id.idx, idx);
+                        trace!("try_steal_task -- signal_work; self={:?}; from={}",
+                               self, idx);
 
                         // Signal other workers that work is available
-                        self.inner.signal_work(&self.inner);
+                        inner.signal_work(inner);
 
                         return true;
                     }
@@ -302,22 +379,27 @@ impl Worker {
         found_work
     }
 
-    fn run_task(&self, task: Task, notify: &Arc<Notifier>, sender: &mut Sender) {
+    fn run_task(&self,
+                task: Task,
+                notify: &Arc<Notifier>,
+                sender: &mut Sender,
+                inner: &Arc<Inner>)
+    {
         use task::Run::*;
 
         match task.run(notify, sender) {
             Idle => {}
             Schedule => {
-                self.entry().push_internal(task);
+                self.entry(inner).push_internal(task);
             }
             Complete => {
-                let mut state: State = self.inner.state.load(Acquire).into();
+                let mut state: State = inner.state.load(Acquire).into();
 
                 loop {
                     let mut next = state;
                     next.dec_num_futures();
 
-                    let actual = self.inner.state.compare_and_swap(
+                    let actual = inner.state.compare_and_swap(
                         state.into(), next.into(), AcqRel).into();
 
                     if actual == state {
@@ -329,7 +411,7 @@ impl Worker {
                             // up any sleeping worker so that they can notice
                             // the shutdown state.
                             if next.is_terminated() {
-                                self.inner.terminate_sleeping_workers();
+                                inner.terminate_sleeping_workers();
                             }
                         }
 
@@ -350,19 +432,19 @@ impl Worker {
     /// Returns `true` if the operation was able to complete in a consistent
     /// state.
     #[inline]
-    fn drain_inbound(&self) -> bool {
+    fn drain_inbound(&self, inner: &Arc<Inner>) -> bool {
         use task::Poll::*;
 
         let mut found_work = false;
 
         loop {
-            let task = unsafe { self.entry().inbound.poll() };
+            let task = unsafe { self.entry(inner).inbound.poll() };
 
             match task {
                 Empty => {
                     if found_work {
                         trace!("found work while draining; signal_work");
-                        self.inner.signal_work(&self.inner);
+                        inner.signal_work(inner);
                     }
 
                     return true;
@@ -370,14 +452,14 @@ impl Worker {
                 Inconsistent => {
                     if found_work {
                         trace!("found work while draining; signal_work");
-                        self.inner.signal_work(&self.inner);
+                        inner.signal_work(inner);
                     }
 
                     return false;
                 }
                 Data(task) => {
                     found_work = true;
-                    self.entry().push_internal(task);
+                    self.entry(inner).push_internal(task);
                 }
             }
         }
@@ -386,10 +468,10 @@ impl Worker {
     /// Put the worker to sleep
     ///
     /// Returns `true` if woken up due to new work arriving.
-    fn sleep(&self) -> bool {
-        trace!("Worker::sleep; idx={}", self.id.idx);
+    fn sleep(&self, inner: &Arc<Inner>) -> bool {
+        trace!("Worker::sleep; worker={:?}", self);
 
-        let mut state: WorkerState = self.entry().state.load(Acquire).into();
+        let mut state: WorkerState = self.entry(inner).state.load(Acquire).into();
 
         // The first part of the sleep process is to transition the worker state
         // to "pushed". Now, it may be that the worker is already pushed on the
@@ -413,7 +495,7 @@ impl Worker {
                 actual => panic!("unexpected worker state; {}", actual),
             }
 
-            let actual = self.entry().state.compare_and_swap(
+            let actual = self.entry(inner).state.compare_and_swap(
                 state.into(), next.into(), AcqRel).into();
 
             if actual == state {
@@ -426,11 +508,11 @@ impl Worker {
                 if !state.is_pushed() {
                     debug_assert!(next.is_pushed());
 
-                    trace!("  sleeping -- push to stack; idx={}", self.id.idx);
+                    trace!("  sleeping -- push to stack; worker={:?}", self);
 
                     // We obtained permission to push the worker into the
                     // sleeper queue.
-                    if let Err(_) = self.inner.push_sleeper(self.id.idx) {
+                    if let Err(_) = inner.push_sleeper(self.id.idx) {
                         trace!("  sleeping -- push to stack failed; idx={}", self.id.idx);
                         // The push failed due to the pool being terminated.
                         //
@@ -448,7 +530,7 @@ impl Worker {
 
         trace!("    -> starting to sleep; idx={}", self.id.idx);
 
-        let sleep_until = self.inner.config.keep_alive
+        let sleep_until = inner.config.keep_alive
             .map(|dur| Instant::now() + dur);
 
         // The state has been transitioned to sleeping, we can now wait by
@@ -468,14 +550,14 @@ impl Worker {
                     let dur = when - now;
 
                     unsafe {
-                        (*self.entry().park.get())
+                        (*self.entry(inner).park.get())
                             .park_timeout(dur)
                             .unwrap();
                     }
                 }
                 None => {
                     unsafe {
-                        (*self.entry().park.get())
+                        (*self.entry(inner).park.get())
                             .park()
                             .unwrap();
                     }
@@ -485,7 +567,7 @@ impl Worker {
             trace!("    -> wakeup; idx={}", self.id.idx);
 
             // Reload the state
-            state = self.entry().state.load(Acquire).into();
+            state = self.entry(inner).state.load(Acquire).into();
 
             loop {
                 match state.lifecycle() {
@@ -496,7 +578,7 @@ impl Worker {
                             let mut next = state;
                             next.set_lifecycle(WORKER_RUNNING);
 
-                            let actual = self.entry().state.compare_and_swap(
+                            let actual = self.entry(inner).state.compare_and_swap(
                                 state.into(), next.into(), AcqRel).into();
 
                             if actual == state {
@@ -517,7 +599,7 @@ impl Worker {
                 let mut next = state;
                 next.set_lifecycle(WORKER_SHUTDOWN);
 
-                let actual = self.entry().state.compare_and_swap(
+                let actual = self.entry(inner).state.compare_and_swap(
                     state.into(), next.into(), AcqRel).into();
 
                 if actual == state {
@@ -535,35 +617,33 @@ impl Worker {
     /// This doesn't actually put the thread to sleep. It calls
     /// `park.park_timeout` with a duration of 0. This allows the park
     /// implementation to perform any work that might be done on an interval.
-    fn sleep_light(&self) {
+    fn sleep_light(&self, inner: &Arc<Inner>) {
         unsafe {
-            (*self.entry().park.get())
+            (*self.entry(inner).park.get())
                 .park_timeout(Duration::from_millis(0))
                 .unwrap();
         }
     }
 
-    fn entry(&self) -> &WorkerEntry {
-        &self.inner.workers[self.id.idx]
+    fn entry<'a>(&self, inner: &'a Arc<Inner>) -> &'a WorkerEntry {
+        &inner.workers[self.id.idx]
     }
-}
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        trace!("shutting down thread; idx={}", self.id.idx);
-
+    fn maybe_finalize(&mut self, inner: &Arc<Inner>) {
         if self.should_finalize.get() {
             // Drain all work
-            self.drain_inbound();
+            self.drain_inbound(inner);
 
-            while let Some(_) = self.entry().deque.pop() {
+            while let Some(_) = self.entry(inner).deque.pop() {
             }
 
             // TODO: Drain the work queue...
-            self.inner.worker_terminated();
+            inner.worker_terminated();
         }
     }
 }
+
+// ===== impl WorkerId =====
 
 impl WorkerId {
     pub(crate) fn new(idx: usize) -> WorkerId {

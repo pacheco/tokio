@@ -1,3 +1,4 @@
+use backup::Backup;
 use config::{Config, MAX_WORKERS};
 use sleep_stack::{
     SleepStack,
@@ -47,6 +48,9 @@ pub(crate) struct Inner {
     //
     // This will *usually* be a small number
     pub workers: Box<[WorkerEntry]>,
+
+    // Backup workers
+    pub backup: Backup,
 
     // Task notified when the worker shuts down
     pub shutdown_task: ShutdownTask,
@@ -189,11 +193,9 @@ impl Inner {
         Worker::with_current(|worker| {
             match worker {
                 Some(worker) => {
-                    let idx = worker.id.idx;
+                    trace!("    -> submit internal; worker={:?}", worker);
 
-                    trace!("    -> submit internal; idx={}", idx);
-
-                    worker.inner.workers[idx].submit_internal(task);
+                    worker.primary().submit_internal(task);
                     worker.inner.signal_work(inner);
                 }
                 None => {

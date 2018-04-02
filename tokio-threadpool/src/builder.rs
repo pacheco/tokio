@@ -1,3 +1,4 @@
+use backup::Backup;
 use callback::Callback;
 use config::{Config, MAX_WORKERS};
 use park::{BoxPark, BoxedPark, DefaultPark};
@@ -69,6 +70,9 @@ pub struct Builder {
     /// Number of workers to spawn
     pool_size: usize,
 
+    /// max number of backup worker threads.
+    backup_pool_size: usize,
+
     /// Generates the `Park` instances
     new_park: Box<Fn(&WorkerId) -> BoxPark>,
 }
@@ -105,6 +109,7 @@ impl Builder {
 
         Builder {
             pool_size: num_cpus,
+            backup_pool_size: 100,
             config: Config {
                 keep_alive: None,
                 name_prefix: None,
@@ -339,6 +344,7 @@ impl Builder {
             num_workers: AtomicUsize::new(self.pool_size),
             next_thread_id: AtomicUsize::new(0),
             workers: workers.into_boxed_slice(),
+            backup: Backup::new(self.backup_pool_size),
             shutdown_task: ShutdownTask {
                 task1: AtomicTask::new(),
                 #[cfg(feature = "unstable-futures")]
